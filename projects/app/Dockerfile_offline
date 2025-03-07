@@ -1,0 +1,71 @@
+# --------- install dependence -----------
+FROM registry.cn-hangzhou.aliyuncs.com/fastgpt/fastgpt-build:v4.8.12 AS builder
+WORKDIR /app
+ARG proxy
+# COPY ./packages ./packages
+# COPY ./projects/app ./projects/app
+RUN [ -z "$proxy" ] || sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+
+RUN mkdir -p /fastgpt
+RUN mkdir -p /app/projects/app
+RUN mkdir -p /app/packages/
+COPY ./projects/app /fastgpt/projects/app
+COPY ./packages /fastgpt/packages
+RUN rsync -av --exclude='node_modules' /fastgpt/packages/global/ /app/packages/global/
+RUN rsync -av --exclude='node_modules' /fastgpt/packages/plugins/ /app/packages/plugins/
+RUN rsync -av --exclude='node_modules' /fastgpt/packages/service/ /app/packages/service/
+RUN rsync -av --exclude='node_modules' /fastgpt/packages/web/ /app/packages/web/
+RUN rsync -av --exclude='node_modules' /fastgpt/projects/app/ /app/projects/app/
+RUN pnpm --filter=app build
+
+# --------- 使用中间镜像，减少目标输出镜像尺寸 -----------
+FROM node:20.14.0-alpine AS centor
+WORKDIR /app
+# create user and use it
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+# copy running files
+COPY --from=builder /app/projects/app/public /app/projects/app/public
+COPY --from=builder /app/projects/app/next.config.js /app/projects/app/next.config.js
+COPY --from=builder --chown=nextjs:nodejs /app/projects/app/.next/standalone /app/
+COPY --from=builder --chown=nextjs:nodejs /app/projects/app/.next/static /app/projects/app/.next/static
+# copy server chunks
+COPY --from=builder --chown=nextjs:nodejs /app/projects/app/.next/server/chunks /app/projects/app/.next/server/chunks
+# copy worker
+COPY --from=builder --chown=nextjs:nodejs /app/projects/app/.next/server/worker /app/projects/app/.next/server/worker
+
+# copy standload packages
+COPY --from=builder /app/node_modules/tiktoken ./node_modules/tiktoken
+RUN rm -rf ./node_modules/tiktoken/encoders
+COPY --from=builder /app/node_modules/@zilliz/milvus2-sdk-node ./node_modules/@zilliz/milvus2-sdk-node
+# copy package.json to version file
+COPY --from=builder /app/projects/app/package.json ./package.json 
+# copy config
+COPY --chown=nextjs:nodejs ./projects/app/data /app/data
+
+
+# --------- runner -----------
+FROM node:20.14.0-alpine AS runner
+WORKDIR /app
+
+ARG proxy
+
+# create user and use it
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+COPY --from=centor /app /app
+#COPY --chown=nextjs:nodejs ./projects/app/localtime /etc/localtime
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+
+EXPOSE 3000
+
+USER nextjs
+
+ENV serverPath=./projects/app/server.js
+
+ENTRYPOINT ["sh","-c","node --max-old-space-size=4096 ${serverPath}"]
+
